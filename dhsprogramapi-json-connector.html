@@ -1,0 +1,327 @@
+<html>
+<head>
+<title>The DHS Program JSON connector</title>
+<link rel="stylesheet" href="https://code.jquery.com/ui/1.11.4/themes/smoothness/jquery-ui.css">
+<script
+        src="https://code.jquery.com/jquery-1.12.4.min.js"
+        integrity="sha256-ZosEbRLbNQzLpnKIkEdrPv7lOy9C27hHQ+Xp8a4MxAQ="
+        crossorigin="anonymous">        
+</script>
+<script
+        src="https://code.jquery.com/ui/1.11.4/jquery-ui.min.js"
+        integrity="sha256-xNjb53/rY+WmG+4L6tTl9m6PpqknWZvRt0rO1SRnJzw="
+        crossorigin="anonymous">
+</script>
+<script src="https://public.tableau.com/javascripts/api/tableauwdc-1.1.0.js" type="text/javascript"></script>
+<script type="text/javascript">
+ 
+(function() {
+
+  var myConnector = tableau.makeConnector();
+
+  myConnector.init = function () {
+    tableau.connectionName = 'JSON data';
+    tableau.initCallback();
+  };
+
+  myConnector.getColumnHeaders = function() {
+    console.log("Getting Column Data");
+    _retrieveJsonData(function (tableData) {
+      var headers = tableData.headers;
+      var fieldNames = [];
+      var fieldTypes = [];
+
+      for (var fieldName in headers) {
+        if (headers.hasOwnProperty(fieldName)) {
+          fieldNames.push(fieldName);
+          fieldTypes.push(headers[fieldName]);
+        }
+      }
+      tableau.headersCallback(fieldNames, fieldTypes); // tell tableau about the fields and their types
+    });
+  };
+      
+  myConnector.getTableData = function (lastRecordToken) {
+    console.log("Getting Table Data");
+    _retrieveJsonData(function (tableData) {
+      var rowData = tableData.rowData;
+      tableau.dataCallback(rowData, rowData.length.toString(), false);
+      console.log("Data Sent");
+    });
+  };
+
+  tableau.registerConnector(myConnector);
+})();
+
+function _retrieveJsonData(retrieveDataCallback) {
+  if (!window.cachedTableData) {
+    console.log("Retrieving JSON Data");
+    var conData = JSON.parse(tableau.connectionData);
+    var jsonString = conData.jsonString;
+    if (conData.jsonUrl) {
+      var successCallback = function(data) 
+      {
+        window.cachedTableData = _jsToTable(data);
+        retrieveDataCallback(window.cachedTableData);
+      };
+      // Go get the json data
+      // This is the first, and most basic, of many attempts to get the data.
+      // We make different attempts that use different approaches, because if
+      // the server we are requesting data from has not enabled CORS, then the
+      // request will fail. In that case we try different proxies to try to get
+      // around the same origin policy. This is not as clean as it could be, but 
+      // for a general purpose connector, we want to make every attempt we can
+      // to pull in the data
+      _basicAjaxRequest(conData.jsonUrl, successCallback);
+      return;
+    }
+    try {
+      window.cachedTableData = _jsToTable(JSON.parse(conData.jsonString));
+    }
+    catch (e) {
+      tableau.abortWithError("unable to parse json data");
+      return;
+    }
+  }
+  retrieveDataCallback(window.cachedTableData);
+}
+
+// try the straightforward request
+function _basicAjaxRequest(url, successCallback){
+  _ajaxRequestHelper(url, successCallback);
+}
+
+// There are a lot of ways to handle URLS. This method only gets a straight JSON data.
+function _ajaxRequestHelper(url, successCallback){
+
+  var objArrayInternalDeferred = [];      //Array of internal deferred objects if required for pagination.
+  var objResult;                //Final data result to return to the user
+
+  //Make an initial ajax call to retreive the data.
+  console.log("URL: " + url);
+  $.ajax({
+    async: true,
+      type: 'GET',
+      url: url,
+      dataType: 'json',
+      success: function(data) {
+        //Set new data.
+        objResult = data;
+
+        //Obtain Total Number of Pages.
+        var nTotalPages = objResult.TotalPages;
+
+        //Let the user know which page.
+        console.log("Received data from page 1 of " + nTotalPages)
+
+        //Check if there is more data to be obtained through pagination.
+        if(nTotalPages > 1) {
+          //Create a deferred object for each additional page.
+          for(var nIndex = 2; nIndex <= nTotalPages; nIndex++) {
+            var strCurURL = url;
+            var strCurURL = _addQueryParams(url, "page=" + nIndex);
+            console.log("New URL = " + strCurURL);
+            var objTempDeferred = $.ajax({
+                            async: true,
+                            type: 'GET',
+                            url: strCurURL,
+                            dataType: 'json',
+                            success: function(data) {
+                          //Append data.
+                              objResult.Data.push.apply(objResult.Data, data.Data);
+
+                              //Let the user know which page.
+                              console.log("Received data from page " + nIndex + " of " + nTotalPages);
+                              nIndex++;
+                            },
+                            error: function(errMsg) {
+                              console.log("Failed to receive data from page " + nIndex + " of " + nTotalPages);
+                              console.log(errMsg);
+                            }
+                          });
+            objArrayInternalDeferred.push(objTempDeferred);
+          }
+
+          //Create a multiple deferred statement for all the new queries.
+          $.when.apply(
+            $, objArrayInternalDeferred
+          ).done(function() {
+            //Pass data to success callback.
+            successCallback(objResult);
+          }).fail(function(errMsg){
+            //Abort every deferred object that is still running.
+            $.each(objArrayInternalDeferred, function(index, objDef) {
+              if(objDef.state() === "pending") {
+                console.log("rejected");
+                objDef.abort();
+              }
+            });
+
+            //Call fail message.
+            _giveUpOnUrl9(url, successCallback);
+          });
+
+          //Reset Index for log messages.
+          nIndex = 2;
+        }
+        else {
+          //Pass data to success callback.
+          successCallback(objResult);
+        }
+      },
+      error: function(errMsg) {
+        _giveUpOnUrl9(url, successCallback);
+      }
+  });
+}
+
+/**
+*/
+function _addQueryParams(sourceURL, strNewParam) {
+  //If the string does not contain any parameters, then add with an "?" in front.
+  if(sourceURL.indexOf("?") == -1) {
+    sourceURL += "?" + strNewParam;
+  }
+  else {  //Add additional Parameters with &
+    sourceURL += "&" + strNewParam;
+  }
+
+  //Return the Parameters string with the new parameter added.
+  return sourceURL;
+}
+
+function _giveUpOnUrl9(url, successCallback) {
+  tableau.abortWithError("Could not load url: " + url);
+}
+
+// Takes a hierarchical javascript object and tries to turn it into a table
+// Returns an object with headers and the row level data
+function _jsToTable(objectBlob) {
+  var rowData = _flattenData(objectBlob);
+  var headers = _extractHeaders(rowData);
+  return {"headers":headers, "rowData":rowData};
+}
+
+// Given an object:
+//   - finds the longest array in the object
+//   - flattens each element in that array so it is a single object with many properties
+// If there is no array that is a descendent of the original object, this wraps
+// the input in a single element array.
+function _flattenData(objectBlob) {
+  // first find the longest array
+  var longestArray = _findLongestArray(objectBlob, []);
+  if (!longestArray || longestArray.length == 0) {
+    // if no array found, just wrap the entire object blob in an array
+    longestArray = [objectBlob];
+  }
+  for (var ii = 0; ii < longestArray.length; ++ii) {
+    _flattenObject(longestArray[ii]);
+  }
+  return longestArray;
+}
+
+// Given an object with hierarchical properties, flattens it so all the properties
+// sit on the base object.
+function _flattenObject(obj) {
+  for (var key in obj) {
+    if (obj.hasOwnProperty(key) && typeof obj[key] == 'object') {
+      var subObj = obj[key];
+      _flattenObject(subObj);
+      for (var k in subObj) {
+        if (subObj.hasOwnProperty(k)) {
+          obj[key + '_' + k] = subObj[k];
+        }
+      }
+      delete obj[key];
+    }
+  }
+}
+
+// Finds the longest array that is a descendent of the given object
+function _findLongestArray(obj, bestSoFar) {
+  if (!obj) {
+    // skip null/undefined objects
+    return bestSoFar;
+  }
+
+  // if an array, just return the longer one
+  if (obj.constructor === Array) {
+    // I think I can simplify this line to
+    // return obj;
+    // and trust that the caller will deal with taking the longer array
+    return (obj.length > bestSoFar.length) ? obj : bestSoFar;
+  }
+  if (typeof obj != "object") {
+    return bestSoFar;
+  }
+  for (var key in obj) {
+    if (obj.hasOwnProperty(key)) {
+      var subBest = _findLongestArray(obj[key], bestSoFar);
+      if (subBest.length > bestSoFar.length) {
+        bestSoFar = subBest;
+      }
+    }
+  }
+  return bestSoFar;
+}
+
+// Given an array of js objects, returns a map from data column name to data type
+function _extractHeaders(rowData) {
+  var toRet = {};
+  for (var row = 0; row < rowData.length; ++row) {
+    var rowLine = rowData[row];
+    for (var key in rowLine) {
+      if (rowLine.hasOwnProperty(key)) {
+        if (!(key in toRet)) {
+          toRet[key] = _determineType(rowLine[key]);
+        }
+      }
+    }
+  }
+  return toRet;
+}
+
+// Given a primitive, tries to make a guess at the data type of the input
+function _determineType(primitive) {
+  // possible types: 'float', 'date', 'datetime', 'bool', 'string', 'int'
+  if (parseInt(primitive) == primitive) return 'int';
+  if (parseFloat(primitive) == primitive) return 'float';
+  if (isFinite(new Date(primitive).getTime())) return 'datetime';
+  return 'string';
+}
+
+function _submitToJsonToTableau(jsonString, jsonUrl) {
+    var conData = {"jsonString" : jsonString, "jsonUrl": jsonUrl};
+    tableau.connectionData = JSON.stringify(conData);
+    tableau.submit();  
+}
+
+$(document).ready(function(){
+  var cancel = function (e) {    
+      e.stopPropagation();
+      e.preventDefault();
+  }
+  $("#inputForm").submit(function(e) { // This event fires when a button is clicked
+    // Since we use a form for input, make sure to stop the default form behavior
+    cancel(e);
+   //var jsonString = $('textarea[name=jsonText]')[0].value.trim();
+   var jsonString = "";
+    var jsonUrl = $('input[name=jsonUrl]')[0].value.trim();
+    _submitToJsonToTableau(jsonString, jsonUrl);
+  });
+});
+
+</script>
+</head>
+<body>
+
+<form id="inputForm" action="">
+  Enter a URL for JSON data: 
+  <input type="text" name="jsonUrl" size="50" />  
+  <br>
+  <!-- <textarea name="jsonText" rows="10" cols="70"/></textarea> -->
+  <input type="submit" value="Submit">
+</form>
+
+</body>
+</html>
